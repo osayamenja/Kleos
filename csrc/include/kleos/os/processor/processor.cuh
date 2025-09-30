@@ -168,6 +168,7 @@ namespace kleos::processor{
             }
         }
         else {
+            // scatter
             uint wT[wE];
             const auto tid = threadIdx.x % wS;
             #pragma unroll
@@ -488,6 +489,100 @@ namespace kleos::processor{
         }
     }
 
+    // fused GEMM, epilogue and data transfer, with dynamic M and static N and K
+    template<
+        typename Operator,
+        typename ActivationOp,
+        unsigned int elems = 64
+    >
+    __forceinline__ __device__
+    void fGETv2(typename Operator::ValueType* __restrict__ const& workspace,
+        const typename Operator::ValueType* __restrict__ const& inputs,
+        const typename Operator::ValueType* __restrict__ const& weights,
+        typename Operator::ValueType* __restrict__ const& output,
+        const typename Operator::ValueType* __restrict__ const& bias,
+        const int& M,
+        const int& tileIdx) {
+        using BLAS = typename Operator::BLAS;
+        static_assert(cublasdx::is_complete_blas_execution_v<BLAS>, "BLAS should be executable");
+        using Element = typename BLAS::a_value_type;
+        using ElementC = typename BLAS::c_value_type;
+        constexpr auto gemmMainloop = typename Operator::Mainloop{};
+        const auto partitioner = BLAS().suggest_partitioner();
+        auto accumulator = partitioner.make_accumulator_fragment();
+        cublasdx::clear(accumulator);
+        using BM = typename Operator::BM;
+        using BN = typename Operator::BN;
+        using NT = typename Operator::NT;
+        // Row-major
+        const auto strideC = cute::conditional_return<
+            cublasdx::arrangement_of_v_c<BLAS> == cublasdx::row_major>
+            (cute::Stride<NT, cute::_1>{}, cute::make_stride(cute::_1{}, M));
+        const auto mC = cute::make_tensor(cute::make_gmem_ptr(output),
+            cute::make_layout(cute::make_shape(M, NT{}), strideC));
+        // M is padded, such that the below is correct
+        const auto tilesM = M / BM{};
+        using TilesN = cute::Int<NT{} / BN{}>;
+        const auto tileCoord = cute::idx2crd(tileIdx, cute::Shape(tilesM, TilesN{}),
+                cute::Stride<TilesN, cute::_1>{});
+        const auto ctaCoord = cute::make_coord(cute::get<0>(tileCoord), cute::get<1>(tileCoord), cute::_);
+        const auto gC = cute::local_tile(mC, cute::Shape<BM, BN>{}, cute::select<0, 1>(ctaCoord));
+        // prefetch bias from global memory
+        const auto mD = make_tensor(cute::make_gmem_ptr(bias),
+            cute::Layout<cute::Shape<cute::_1, NT>, cute::Stride<cute::_0, cute::_1>>{});
+        const auto biasCoord = idx2crd(tileIdx, cute::Shape<cute::_1, TilesN>{},
+            cute::Stride<BN, cute::_1>{});
+        const auto gD = cute::local_tile(mD, cute::Shape<cute::_1, BN>{}, cute::get<1>(biasCoord));
+        if (threadIdx.x < BN{}) {
+            using LT =  cuda::std::conditional_t<sizeof(Element) == 2, uint16_t, uint32_t>;
+            CAST_TO(LT, workspace)[threadIdx.x] = __ldg(CONST_CAST_TO(LT, &gD(threadIdx.x)));
+        }
+        gemmMainloop(workspace + BN{}, accumulator, inputs, weights, output, M, tileIdx);
+        // Epilogue
+        constexpr auto gCStoreOp = cutlass::NumericConverter<Element, ElementC>{};
+        constexpr auto epilogueOp = FAA<Element, ActivationOp>{};
+        constexpr auto trips = cublasdx::size(accumulator) / elems;
+        const auto rC = cute::make_tensor(cute::make_rmem_ptr(CAST_TO(Element, accumulator.data())),
+            cute::Layout<cute::Shape<cute::_1, BN>, cute::Stride<BN, cute::_1>>{});
+        cute::for_each(cute::make_int_sequence<cublasdx::size(accumulator)>{}, [&](auto j) {
+            rC(j) = gCStoreOp(accumulator(j));
+        });
+        // copy single bias value
+        Element rB[trips];
+        #pragma unroll
+        for (uint i = 0 ; i < trips; ++i) {
+            rB[i] = workspace[threadIdx.x % elems + i * elems];
+        }
+        __syncthreads();
+        auto sC = cute::make_tensor(cute::make_smem_ptr(CAST_TO(Element, workspace)),
+            cute::Layout<cute::Shape<BM, BN>,
+            cuda::std::conditional_t<cublasdx::arrangement_of_v_c<BLAS> == cublasdx::row_major,
+                cute::Stride<BN, cute::_1>, cute::Stride<cute::_1, BM>>>{});
+        // rmem -> smem
+        cublasdx::copy_fragment<cublasdx::alignment_of_v_c<BLAS>>(accumulator, sC, partitioner);
+        __syncthreads();
+        const auto rIdx = threadIdx.x / elems * elems;
+        const auto cIdx = threadIdx.x % elems;
+        // smem -> rmem
+        cute::for_each(cute::make_int_sequence<trips>{}, [&](auto i) {
+            cute::for_each(cute::make_int_sequence<elems>{}, [&](auto j) {
+                rC(j + i * elems) = sC(rIdx + j, cIdx);
+            });
+        });
+        // epilogue
+        cute::for_each(cute::make_int_sequence<trips>{}, [&](auto i) {
+            cute::for_each(cute::make_int_sequence<elems>{}, [&](auto j) {
+                rC(j + i * elems) = epilogueOp(rC(j + i * elems), rB[i]);
+            });
+        });
+        // rmem -> gmem
+        cute::for_each(cute::make_int_sequence<trips>{}, [&](auto i) {
+            cute::for_each(cute::make_int_sequence<elems>{}, [&](auto j) {
+                gC(rIdx + j, cIdx + i * elems) = rC(j + i * elems);
+            });
+        });
+    }
+
     struct __align__(16) ProcessorArgs{
         // sensible sentinel values
         unsigned int* __restrict__ sQ = nullptr;
@@ -671,6 +766,8 @@ namespace kleos::processor{
         }
         using PreGEMM = BlockMM<ACC::ActivationOp, Element>;
         using PostGEMM = BlockMM<ACC::ActivationOpX, Element>;
+        using PRO = GO<ACC::P::value, ACC::H::value>;
+        using PSO = GO<ACC::H::value, ACC::P::value>;
         constexpr uint H = ACC::H::value;
         constexpr auto tN = ACC::TN::value;
         constexpr auto tNx = ACC::TNx::value;
@@ -698,19 +795,19 @@ namespace kleos::processor{
             }
             __syncthreads();
             tqs.interrupt = globalInterrupt;
-            // if we received an interrupt, there is nothing to do next
+            // if we receive an interrupt, there is nothing to do next
             if (!tqs.interrupt) {
                 // shared -> registers
                 rCurrentTask = currentTask;
                 switch (rCurrentTask.taskType) {
                     case TaskType::preGEMM: {
                         constexpr unsigned int preIndex = 0;
-                        fGET<PreGEMM, ACC::P::value, ACC::H::value>(
-                            CAST_TO(typename PreGEMM::MatrixDType, workspace),
-                            CONST_CAST_TO(typename PreGEMM::MatrixAType, rCurrentTask.aData),
-                            CONST_CAST_TO(typename PreGEMM::MatrixBType, rCurrentTask.bData[preIndex]),
-                            CAST_TO(typename PreGEMM::MatrixDType, rCurrentTask.cData[preIndex]),
-                            CONST_CAST_TO(typename PreGEMM::MatrixDType, rCurrentTask.dData[preIndex]),
+                        fGETv2<PRO, AFunction<HIDDEN_ACT, Element>::DT>(
+                            CAST_TO(typename PRO::ValueType, workspace),
+                            CONST_CAST_TO(typename PRO::ValueType, rCurrentTask.aData),
+                            CONST_CAST_TO(typename PRO::ValueType, rCurrentTask.bData[preIndex]),
+                            CAST_TO(typename PRO::ValueType, rCurrentTask.cData[preIndex]),
+                            CONST_CAST_TO(typename PRO::ValueType, rCurrentTask.dData[preIndex]),
                             rCurrentTask.M,
                             rCurrentTask.tileIdx);
                         __syncthreads();
@@ -731,12 +828,12 @@ namespace kleos::processor{
                     break;
                     case TaskType::postGEMM: {
                         constexpr unsigned int postIndex = 1;
-                        fGET<PostGEMM, ACC::H::value, ACC::P::value>(
-                            CAST_TO(typename PostGEMM::MatrixDType, workspace),
-                            CONST_CAST_TO(typename PostGEMM::MatrixAType, rCurrentTask.aData),
-                            CONST_CAST_TO(typename PostGEMM::MatrixBType, rCurrentTask.bData[postIndex]),
-                            CAST_TO(typename PostGEMM::MatrixDType, rCurrentTask.cData[postIndex]),
-                            CONST_CAST_TO(typename PostGEMM::MatrixDType, rCurrentTask.dData[postIndex]),
+                        fGETv2<PSO, cublasdx::identity>(
+                            CAST_TO(typename PRO::ValueType, workspace),
+                            CONST_CAST_TO(typename PRO::ValueType, rCurrentTask.aData),
+                            CONST_CAST_TO(typename PRO::ValueType, rCurrentTask.bData[postIndex]),
+                            CAST_TO(typename PRO::ValueType, rCurrentTask.cData[postIndex]),
+                            CONST_CAST_TO(typename PRO::ValueType, rCurrentTask.dData[postIndex]),
                             rCurrentTask.M,
                             currentTask.tileIdx);
                         __syncthreads();

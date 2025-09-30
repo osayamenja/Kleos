@@ -116,11 +116,15 @@ if(CCCL_ADDED)
     target_link_libraries(csrc PRIVATE CCCL::CCCL)
 endif()
 
+# cuBLASDx
+find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
+target_link_libraries(csrc PRIVATE mathdx::cublasdx)
+
 #CUTLASS business
 CPMAddPackage(
         NAME CUTLASS
         GITHUB_REPOSITORY nvidia/cutlass
-        GIT_TAG main
+        GIT_TAG v3.9.2 # pin here to support cuBLASDx
         DOWNLOAD_ONLY TRUE
         OPTIONS
         "CUTLASS_NVCC_ARCHS=${COMPUTE_CAPABILITY}"
@@ -177,10 +181,6 @@ if(DEFINED ENV{NERSC_HOST} AND "$ENV{NERSC_HOST}" STREQUAL "perlmutter")
 else ()
     target_link_libraries(csrc PRIVATE nvshmem::nvshmem)
 endif ()
-
-# cuBLASDx
-find_package(mathdx REQUIRED COMPONENTS cublasdx CONFIG)
-target_link_libraries(csrc PRIVATE mathdx::cublasdx)
 
 target_compile_options(csrc PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xfatbin -compress-all>
